@@ -2,3 +2,5 @@
 estado_extractor.json
 __pycache__/
 *.pyc
+Data/oncologia.db
+Data/estado_extractor.json
