@@ -31,7 +31,7 @@ BASE                   = "https://api.mercadopublico.cl/servicios/v1/publico"
 PAUSA_LISTA            = 1.5
 PAUSA_DETALLE          = 1.0
 
-FECHA_INICIO_HISTORICO = date(2024, 12, 1)
+FECHA_INICIO_HISTORICO = date(2024, 1, 1)
 
 ESTADO_FILE = Path("estado_extractor.json")
 DB_SQLITE   = Path("oncologia.db")
