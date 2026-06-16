@@ -838,8 +838,9 @@ with tabs[3]:
 
     buscar_ab = f5.text_input("Buscar en nombre", key="bus_ab")
 
-    monto_min = int(abiertos["Monto_estimado"].min())
-    monto_max = int(abiertos["Monto_estimado"].max())
+    _montos   = abiertos["Monto_estimado"].fillna(0)
+    monto_min = int(_montos.min()) if not _montos.empty and _montos.notna().any() else 0
+    monto_max = int(_montos.max()) if not _montos.empty and _montos.notna().any() else 0
     if monto_min < monto_max:
         rango_monto = st.slider(
             "Rango monto estimado (CLP)",

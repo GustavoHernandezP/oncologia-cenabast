@@ -46,7 +46,7 @@ FECHA_INICIO_HISTORICO = date(2024, 1, 1)
 # Cambiar a True para procesar solo el período indicado.
 # Los registros existentes en ese rango se sobreescriben.
 MODO_RANGO  = False
-FECHA_DESDE = date(2024, 12, 1)
+FECHA_DESDE = date(2024, 1, 1)
 FECHA_HASTA = date(2026, 6, 17)
 
 ESTADO_FILE = Path("estado_extractor.json")
