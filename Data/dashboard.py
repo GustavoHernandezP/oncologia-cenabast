@@ -33,6 +33,12 @@ def fmt_mm(v):
         return fmt_num(v / 1_000_000, dec=0) + " MM"
     return fmt_num(v, dec=0)
 
+def fmt_cant(v):
+    """Formatea cantidad entera en formato chileno."""
+    if pd.isna(v) or v == 0:
+        return "—"
+    return f"{int(v):,}".replace(",", ".")
+
 PLOTLY_LOCALE = dict(separators=",.")   # decimal=",", miles="."
 
 # ── Carga de datos ─────────────────────────────────────────────────────────────
@@ -46,13 +52,10 @@ def load_data():
     items = pd.read_sql("SELECT * FROM items", conn)
     conn.close()
 
-    # Fechas: tomar solo YYYY-MM-DD para evitar problemas con milisegundos
     lics["Fecha_adjudicacion"] = pd.to_datetime(lics["Fecha_adjudicacion"].str[:10], errors="coerce")
     lics["Fecha_publicacion"]  = pd.to_datetime(lics["Fecha_publicacion"].str[:10],  errors="coerce")
-    # Año_pub: año en que se publicó la licitación (para estadísticas generales)
     lics["Año_pub"] = lics["Fecha_publicacion"].dt.year.astype("Int64")
-    # Año: año de adjudicación REAL (solo tiene valor en adjudicadas)
-    lics["Año"] = lics["Fecha_adjudicacion"].dt.year.astype("Int64")
+    lics["Año"]     = lics["Fecha_adjudicacion"].dt.year.astype("Int64")
     lics["Monto_estimado"] = pd.to_numeric(lics["Monto_estimado"], errors="coerce").fillna(0)
 
     items["Monto_total_item"]    = pd.to_numeric(items["Monto_total_item"],    errors="coerce").fillna(0)
@@ -108,45 +111,326 @@ items_ext["Monto_efectivo"] = items_ext["Monto_total_item"].where(
 
 st.divider()
 
-# ── Locale chileno para tablas (JS: convierte US→CL sin romper el ordenamiento) ──
-st.components.v1.html("""
-<script>
-(function() {
-    function toChilean(t) {
-        t = (t || '').trim();
-        // Patrón: "$ 1,234,567" o "$ 1,234,567.890"
-        var m = t.match(/^\$ ([\d,]+)(?:\.(\d+))?$/);
-        if (!m) return null;
-        var intPart = m[1].replace(/,/g, '.');  // comas→puntos (miles)
-        var decPart = m[2];
-        return '$ ' + intPart + (decPart ? ',' + decPart : '');
-    }
-    function run() {
-        try {
-            var doc = window.parent.document;
-            // Selectores AG Grid (varias versiones de Streamlit)
-            var selectors = [
-                '[data-testid="stDataFrame"] .ag-cell-value',
-                '[data-testid="stDataFrameResizable"] .ag-cell-value',
-                '.stDataFrame .ag-cell-value',
-                '[data-testid="stDataFrame"] [col-id] span'
-            ];
-            selectors.forEach(function(sel) {
-                doc.querySelectorAll(sel).forEach(function(el) {
-                    var r = toChilean(el.textContent);
-                    if (r) el.textContent = r;
-                });
-            });
-        } catch(e) {}
-    }
-    setInterval(run, 200);
-    try {
-        new MutationObserver(run).observe(
-            window.parent.document.body, {childList: true, subtree: true});
-    } catch(e) {}
-})();
-</script>
-""", height=0)
+# ── Fragment functions — definidas a nivel módulo para evitar salto de pestaña ─
+
+@st.fragment
+def render_lab_section(_items_lab, _items_ext, _lics):
+    """Rerun al hacer clic queda dentro del fragment, no salta a Tab 1."""
+    st.subheader("Detalle por laboratorio / proveedor")
+    if _items_lab.empty:
+        st.info("Sin datos de proveedores.")
+        return
+
+    lab_resumen = (
+        _items_lab.groupby("Proveedor")
+        .agg(
+            Licitaciones = ("Codigo_licitacion", "nunique"),
+            Medicamentos = ("Medicamento",        "nunique"),
+            Monto_total  = ("Monto_efectivo",     "sum"),
+        ).sort_values("Monto_total", ascending=False).reset_index()
+    )
+    lab_resumen["Monto_fmt"] = lab_resumen["Monto_total"].apply(fmt_mm)
+
+    ev_lab = st.dataframe(
+        lab_resumen[["Proveedor","Licitaciones","Medicamentos","Monto_fmt"]].rename(
+            columns={"Monto_fmt": "Monto total"}),
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="lab_table_frag",
+    )
+    st.caption("💡 Haz clic en una fila para ver las licitaciones del laboratorio.")
+
+    lab_sel = None
+    if ev_lab.selection.rows:
+        lab_sel = lab_resumen.iloc[ev_lab.selection.rows[0]]["Proveedor"]
+
+    if lab_sel:
+        fa, fb = st.columns([1, 3])
+        año_lab = fa.selectbox(
+            "Año",
+            ["Todos"] + [str(a) for a in AÑOS_DASHBOARD],
+            key="año_lab_detail",
+        )
+
+        codes_lab = _items_ext[_items_ext["Proveedor"] == lab_sel]["Codigo_licitacion"].unique()
+        lics_lab  = _lics[_lics["Codigo"].isin(codes_lab)].copy()
+        if año_lab != "Todos":
+            lics_lab = lics_lab[lics_lab["Año_pub"] == int(año_lab)]
+
+        titulo_exp = f"🏭 **{lab_sel}**" + (f"  — {año_lab}" if año_lab != "Todos" else "  — todos los años")
+        with st.expander(titulo_exp, expanded=True):
+            kl1, kl2, kl3 = st.columns(3)
+            kl1.metric("Licitaciones", f"{len(lics_lab):,}".replace(",","."))
+            kl2.metric("Adjudicadas",  f"{len(lics_lab[lics_lab['Estado']=='Adjudicada']):,}".replace(",","."))
+            kl3.metric("Monto estimado total", fmt_mm(lics_lab["Monto_estimado"].sum()))
+
+            df_lab_show = lics_lab[[
+                "Codigo","Nombre","Medicamento","Estado",
+                "Monto_estimado","Organismo","Fecha_adjudicacion"
+            ]].copy().sort_values("Monto_estimado", ascending=False).reset_index(drop=True)
+            df_lab_show["Monto"] = df_lab_show["Monto_estimado"].apply(fmt_num)
+
+            ev_lic_lab = st.dataframe(
+                df_lab_show[["Codigo","Nombre","Medicamento","Estado","Monto","Organismo","Fecha_adjudicacion"]],
+                use_container_width=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="lab_lics_frag",
+                column_config={
+                    "Fecha_adjudicacion": st.column_config.DateColumn("Adjudicación", format="DD/MM/YYYY"),
+                    "Nombre":             st.column_config.TextColumn("Nombre", width="medium"),
+                },
+            )
+            st.caption("💡 Haz clic en una fila para ver los ítems de esa licitación.")
+
+            if ev_lic_lab.selection.rows:
+                codigo_sel = df_lab_show.iloc[ev_lic_lab.selection.rows[0]]["Codigo"]
+                its_sel = _items_ext[_items_ext["Codigo_licitacion"] == codigo_sel]
+                with st.expander(f"📦 Ítems — {codigo_sel}", expanded=True):
+                    if not its_sel.empty:
+                        its_show = its_sel[[
+                            "NombreProducto","Medicamento","UnidadMedida",
+                            "Cantidad_licitada","Cantidad_adjudicada",
+                            "Monto_unitario","Monto_total_item","Proveedor"
+                        ]].copy()
+                        its_show["Cant. licitada"]   = its_show["Cantidad_licitada"].apply(fmt_cant)
+                        its_show["Cant. adjudicada"] = its_show["Cantidad_adjudicada"].apply(fmt_cant)
+                        its_show["Precio unitario"]  = its_show["Monto_unitario"].apply(lambda v: fmt_num(v, dec=3) if v > 0 else "—")
+                        its_show["Monto total"]      = its_show["Monto_total_item"].apply(fmt_num)
+                        st.dataframe(
+                            its_show[["NombreProducto","Medicamento","UnidadMedida",
+                                      "Cant. licitada","Cant. adjudicada",
+                                      "Precio unitario","Monto total","Proveedor"]].reset_index(drop=True),
+                            use_container_width=True,
+                        )
+                    else:
+                        st.info("Sin ítems registrados para esta licitación.")
+
+
+@st.fragment
+def render_precios_section(_items_med, _items_ext, _lics):
+    st.subheader("Análisis de precios y volumen por medicamento")
+
+    meds_disponibles = sorted([m for m in _items_med["Medicamento"].dropna().unique() if m.strip() != ""])
+    med_detalle_sel  = st.selectbox(
+        "Seleccionar medicamento para ver detalle",
+        ["— ver tabla completa —"] + meds_disponibles,
+        key="med_detalle_sel_frag",
+    )
+
+    items_precio = _items_med[_items_med["Monto_unitario"] > 0]
+    if med_detalle_sel != "— ver tabla completa —":
+        items_precio = items_precio[items_precio["Medicamento"] == med_detalle_sel]
+
+    if items_precio.empty:
+        st.info("Sin datos de precio unitario disponibles.")
+        return
+
+    precio_med = (
+        items_precio.groupby("Medicamento")
+        .agg(
+            Licitaciones        = ("Codigo_licitacion",  "nunique"),
+            Cant_licitada       = ("Cantidad_licitada",  "sum"),
+            Cant_adjudicada     = ("Cantidad_adjudicada","sum"),
+            Precio_prom         = ("Monto_unitario",     "mean"),
+            Precio_min          = ("Monto_unitario",     "min"),
+            Precio_max          = ("Monto_unitario",     "max"),
+            Monto_real          = ("Monto_efectivo",     "sum"),
+        ).reset_index()
+    )
+    precio_med = precio_med.sort_values("Monto_real", ascending=False)
+
+    # Pre-formatear en chileno
+    precio_med["Cant_licitada_fmt"]   = precio_med["Cant_licitada"].apply(fmt_cant)
+    precio_med["Cant_adjudicada_fmt"] = precio_med["Cant_adjudicada"].apply(fmt_cant)
+    precio_med["Precio_prom_fmt"]     = precio_med["Precio_prom"].apply(lambda v: fmt_num(v, dec=3))
+    precio_med["Precio_min_fmt"]      = precio_med["Precio_min"].apply(lambda v: fmt_num(v, dec=3))
+    precio_med["Precio_max_fmt"]      = precio_med["Precio_max"].apply(lambda v: fmt_num(v, dec=3))
+    precio_med["Monto_real_fmt"]      = precio_med["Monto_real"].apply(fmt_mm)
+
+    # Sin columna % adjudicado
+    tabla_precio = precio_med[[
+        "Medicamento","Licitaciones",
+        "Cant_licitada_fmt","Cant_adjudicada_fmt",
+        "Precio_prom_fmt","Precio_min_fmt","Precio_max_fmt",
+        "Monto_real_fmt",
+    ]].rename(columns={
+        "Cant_licitada_fmt":   "Cant. licitada",
+        "Cant_adjudicada_fmt": "Cant. adjudicada",
+        "Precio_prom_fmt":     "Precio unit. prom.",
+        "Precio_min_fmt":      "Precio unit. mín.",
+        "Precio_max_fmt":      "Precio unit. máx.",
+        "Monto_real_fmt":      "Monto real",
+    })
+
+    ev_med = st.dataframe(
+        tabla_precio,
+        use_container_width=True,
+        height=400,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="precios_table_frag",
+    )
+    st.caption("💡 Haz clic en una fila para ver ítems y licitaciones de ese medicamento.")
+
+    if ev_med.selection.rows:
+        med_sel  = precio_med.iloc[ev_med.selection.rows[0]]["Medicamento"]
+        lics_med = _lics[_lics["Medicamento"] == med_sel]
+        its_med  = _items_ext[_items_ext["Medicamento"] == med_sel]
+
+        with st.expander(f"💊 **{med_sel}**", expanded=True):
+            km1, km2, km3, km4 = st.columns(4)
+            km1.metric("Licitaciones",      f"{len(lics_med):,}".replace(",","."))
+            km2.metric("Adjudicadas",       f"{len(lics_med[lics_med['Estado']=='Adjudicada']):,}".replace(",","."))
+            km3.metric("Organismos",        f"{lics_med['Organismo'].nunique():,}".replace(",","."))
+            km4.metric("Monto total",       fmt_mm(lics_med["Monto_estimado"].sum()))
+
+            ec1, ec2 = st.columns(2)
+            with ec1:
+                por_año_m = (lics_med[lics_med["Año_pub"].isin(AÑOS_DASHBOARD)]
+                             .groupby("Año_pub")["Monto_estimado"].sum().reset_index())
+                por_año_m["Año"] = por_año_m["Año_pub"].astype(str)
+                por_año_m["MM"]  = por_año_m["Monto_estimado"] / 1e6
+                por_año_m["Lbl"] = por_año_m["Monto_estimado"].apply(fmt_mm)
+                fig_m_año = px.bar(por_año_m, x="Año", y="MM", text="Lbl",
+                                   title="Monto por año", color_discrete_sequence=["#ff4b4b"])
+                fig_m_año.update_traces(textposition="outside")
+                fig_m_año.update_layout(**PLOTLY_LOCALE)
+                st.plotly_chart(fig_m_año, use_container_width=True)
+
+            with ec2:
+                por_org_m = (lics_med.groupby("Organismo")["Monto_estimado"]
+                             .sum().sort_values(ascending=True).tail(8).reset_index())
+                por_org_m["MM"]  = por_org_m["Monto_estimado"] / 1e6
+                por_org_m["Lbl"] = por_org_m["Monto_estimado"].apply(fmt_mm)
+                fig_m_org = px.bar(por_org_m, x="MM", y="Organismo", orientation="h",
+                                   text="Lbl", title="Top organismos",
+                                   color_discrete_sequence=["#0068c9"])
+                fig_m_org.update_traces(textposition="outside")
+                fig_m_org.update_layout(**PLOTLY_LOCALE)
+                st.plotly_chart(fig_m_org, use_container_width=True)
+
+            # Licitaciones del medicamento — clickeables para ver ítems
+            st.markdown("**Licitaciones**")
+            df_med_show = lics_med[[
+                "Codigo","Nombre","Estado","Organismo","Fecha_adjudicacion","Monto_estimado"
+            ]].copy().sort_values("Monto_estimado", ascending=False).reset_index(drop=True)
+            df_med_show["Monto"] = df_med_show["Monto_estimado"].apply(fmt_num)
+
+            ev_lic_med = st.dataframe(
+                df_med_show[["Codigo","Nombre","Estado","Organismo","Fecha_adjudicacion","Monto"]],
+                use_container_width=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="med_lics_frag",
+                column_config={
+                    "Fecha_adjudicacion": st.column_config.DateColumn("Adjudicación", format="DD/MM/YYYY"),
+                    "Nombre":             st.column_config.TextColumn("Nombre", width="medium"),
+                },
+            )
+            st.caption("💡 Haz clic en una fila para ver los ítems de esa licitación.")
+
+            if ev_lic_med.selection.rows:
+                codigo_med = df_med_show.iloc[ev_lic_med.selection.rows[0]]["Codigo"]
+                its_lic_med = _items_ext[_items_ext["Codigo_licitacion"] == codigo_med]
+                with st.expander(f"📦 Ítems — {codigo_med}", expanded=True):
+                    if not its_lic_med.empty:
+                        its_show = its_lic_med[[
+                            "NombreProducto","UnidadMedida",
+                            "Cantidad_licitada","Cantidad_adjudicada",
+                            "Monto_unitario","Monto_total_item","Proveedor"
+                        ]].copy()
+                        its_show["Cant. licitada"]   = its_show["Cantidad_licitada"].apply(fmt_cant)
+                        its_show["Cant. adjudicada"] = its_show["Cantidad_adjudicada"].apply(fmt_cant)
+                        its_show["Precio unitario"]  = its_show["Monto_unitario"].apply(lambda v: fmt_num(v, dec=3) if v > 0 else "—")
+                        its_show["Monto total"]      = its_show["Monto_total_item"].apply(fmt_num)
+                        st.dataframe(
+                            its_show[["NombreProducto","UnidadMedida","Cant. licitada","Cant. adjudicada",
+                                      "Precio unitario","Monto total","Proveedor"]].reset_index(drop=True),
+                            use_container_width=True,
+                        )
+                    else:
+                        st.info("Sin ítems para esta licitación.")
+
+            # Proveedores del medicamento
+            provs = (
+                its_med[its_med["Proveedor"].str.strip() != ""]
+                .groupby("Proveedor")
+                .agg(Items=("Correlativo","count"), Monto=("Monto_efectivo","sum"))
+                .sort_values("Monto", ascending=False).reset_index()
+            )
+            if not provs.empty:
+                st.markdown("**Proveedores / Laboratorios**")
+                provs["Monto_fmt"] = provs["Monto"].apply(fmt_mm)
+                st.dataframe(
+                    provs[["Proveedor","Items","Monto_fmt"]].rename(columns={"Monto_fmt":"Monto total"}),
+                    use_container_width=True, hide_index=True,
+                )
+
+    # Gráfico precio unitario promedio top 15
+    st.subheader("Precio unitario promedio — Top 15 medicamentos")
+    top_precio = precio_med.nlargest(15, "Precio_prom").sort_values("Precio_prom")
+    top_precio["Etiqueta"] = top_precio["Precio_prom"].apply(lambda v: fmt_num(v, dec=3))
+    fig_precio = px.bar(
+        top_precio, x="Precio_prom", y="Medicamento",
+        orientation="h", text="Etiqueta",
+        labels={"Precio_prom": "Precio unitario promedio (CLP)", "Medicamento": ""},
+        color_discrete_sequence=["#f0a500"],
+    )
+    fig_precio.update_traces(textposition="outside")
+    fig_precio.update_layout(xaxis_tickformat=",.", height=520, **PLOTLY_LOCALE)
+    st.plotly_chart(fig_precio, use_container_width=True)
+    st.caption("Precio promedio basado en ítems con monto unitario informado en la API.")
+
+
+@st.fragment
+def render_abiertos_tabla(_df_ab, _items_ext):
+    df_show = _df_ab.copy()
+    df_show["Monto estimado"] = df_show["Monto_estimado"].apply(fmt_num)
+    df_show_final = df_show[[
+        "Codigo","Nombre","Medicamento","Estado","Monto estimado",
+        "Organismo","Region","Fecha_publicacion","Fecha_adjudicacion"
+    ]].reset_index(drop=True)
+
+    ev_ab = st.dataframe(
+        df_show_final,
+        use_container_width=True,
+        height=500,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="abiertos_frag",
+        column_config={
+            "Fecha_publicacion":  st.column_config.DateColumn("Fecha publicación",  format="DD/MM/YYYY"),
+            "Fecha_adjudicacion": st.column_config.DateColumn("Fecha adjudicación", format="DD/MM/YYYY"),
+            "Nombre":             st.column_config.TextColumn("Nombre", width="medium"),
+        },
+    )
+    st.caption(f"{len(_df_ab):,} procesos mostrados  |  💡 Haz clic en una fila para ver los ítems solicitados.".replace(",", "."))
+
+    if ev_ab.selection.rows:
+        idx    = ev_ab.selection.rows[0]
+        codigo = _df_ab.reset_index(drop=True).iloc[idx]["Codigo"]
+        its    = _items_ext[_items_ext["Codigo_licitacion"] == codigo]
+        with st.expander(f"📋 Ítems solicitados — {codigo}", expanded=True):
+            if not its.empty:
+                its_show = its[[
+                    "NombreProducto","Medicamento","Categoria","UnidadMedida",
+                    "Cantidad_licitada","Cantidad_adjudicada","Monto_unitario"
+                ]].copy()
+                its_show["Cant. licitada"]   = its_show["Cantidad_licitada"].apply(fmt_cant)
+                its_show["Cant. adjudicada"] = its_show["Cantidad_adjudicada"].apply(fmt_cant)
+                its_show["Precio unitario"]  = its_show["Monto_unitario"].apply(lambda v: fmt_num(v, dec=3) if v > 0 else "—")
+                st.dataframe(
+                    its_show[["NombreProducto","Medicamento","Categoria","UnidadMedida",
+                               "Cant. licitada","Cant. adjudicada","Precio unitario"]].reset_index(drop=True),
+                    use_container_width=True,
+                )
+            else:
+                st.info("Sin ítems registrados para este proceso.")
+
+# ──────────────────────────────────────────────────────────────────────────────
 
 tabs = st.tabs(["📊 Resumen", "🔍 Análisis comparativo", "💊 Medicamentos & Labs", "🔓 Procesos abiertos", "📋 Todos los procesos", "🗄️ Modelo de datos"])
 
@@ -156,12 +440,14 @@ tabs = st.tabs(["📊 Resumen", "🔍 Análisis comparativo", "💊 Medicamentos
 
 with tabs[0]:
 
-    st.subheader("Total histórico")
+    # ── Total histórico (desde 2024) ───────────────────────────────────────────
+    st.subheader("Total histórico — desde 2024")
+    lics_kpi = lics[lics["Año_pub"] >= 2024]
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Total licitaciones",   f"{len(lics):,}".replace(",", "."))
-    k2.metric("Adjudicadas",          f"{len(lics[lics['Estado']=='Adjudicada']):,}".replace(",", "."))
-    k3.metric("Abiertas",             f"{len(lics[lics['Estado'].isin(ESTADOS_ABIERTOS)]):,}".replace(",", "."))
-    k4.metric("Monto estimado total", fmt_mm(lics["Monto_estimado"].sum()))
+    k1.metric("Total licitaciones",   f"{len(lics_kpi):,}".replace(",", "."))
+    k2.metric("Adjudicadas",          f"{len(lics_kpi[lics_kpi['Estado']=='Adjudicada']):,}".replace(",", "."))
+    k3.metric("Abiertas",             f"{len(lics_kpi[lics_kpi['Estado'].isin(ESTADOS_ABIERTOS)]):,}".replace(",", "."))
+    k4.metric("Monto estimado total", fmt_mm(lics_kpi["Monto_estimado"].sum()))
 
     st.divider()
 
@@ -170,9 +456,7 @@ with tabs[0]:
 
     resumen_años = []
     for año in AÑOS_DASHBOARD:
-        # Total publicadas ese año (usa fecha publicación)
         sub   = lics[lics["Año_pub"] == año]
-        # Adjudicadas reales ese año (usa fecha adjudicación)
         adj   = lics[(lics["Año"] == año) & (lics["Estado"] == "Adjudicada")]
         abi   = sub[sub["Estado"].isin(ESTADOS_ABIERTOS)]
         total = len(sub)
@@ -193,12 +477,21 @@ with tabs[0]:
     for i, row in df_años.iterrows():
         with cols_año[i]:
             st.markdown(f"### {row['Año']}")
-            st.metric("Licitaciones",   f"{row['Total']:,}".replace(",", "."))
-            st.metric("Adjudicadas",    f"{row['Adjudicadas']:,}".replace(",", "."),
-                      delta=f"{row['% Adj']}% del total")
-            st.metric("Abiertas",       f"{row['Abiertas']:,}".replace(",", "."))
+            st.metric("Licitaciones", f"{row['Total']:,}".replace(",", "."))
+            # FIX: delta = variación % vs año anterior (no "% del total")
             if i > 0:
-                prev   = df_años.iloc[i - 1]["Monto_num"]
+                prev_adj = df_años.iloc[i - 1]["Adjudicadas"]
+                if prev_adj > 0:
+                    var_adj = round((row["Adjudicadas"] - prev_adj) / prev_adj * 100, 1)
+                    delta_adj = f"{var_adj:+.1f}% vs {df_años.iloc[i-1]['Año']}".replace(".", ",")
+                else:
+                    delta_adj = "—"
+                st.metric("Adjudicadas", f"{row['Adjudicadas']:,}".replace(",", "."), delta=delta_adj)
+            else:
+                st.metric("Adjudicadas", f"{row['Adjudicadas']:,}".replace(",", "."))
+            st.metric("Abiertas", f"{row['Abiertas']:,}".replace(",", "."))
+            if i > 0:
+                prev      = df_años.iloc[i - 1]["Monto_num"]
                 delta_val = row["Monto_num"] - prev
                 delta_str = ("+" if delta_val >= 0 else "−") + fmt_mm(abs(delta_val))
                 st.metric("Monto estimado", fmt_mm(row["Monto_num"]), delta=delta_str)
@@ -233,16 +526,16 @@ with tabs[0]:
 
     with col_b:
         df_años["Etiqueta_pct"] = df_años["% Adj"].apply(lambda v: f"{v}%".replace(".", ","))
+        # FIX: color fijo en lugar de escala continua (que ponía rojo al último)
         fig_pct = px.bar(
             df_años, x="Año", y="% Adj",
             title="% Adjudicadas por año",
             text="Etiqueta_pct",
-            color="% Adj",
-            color_continuous_scale=["#ffe0e0", "#ff4b4b"],
+            color_discrete_sequence=["#21c354"],
         )
         fig_pct.update_traces(textposition="outside")
         fig_pct.update_layout(
-            yaxis_title="% Adjudicadas", coloraxis_showscale=False,
+            yaxis_title="% Adjudicadas",
             **PLOTLY_LOCALE,
         )
         st.plotly_chart(fig_pct, use_container_width=True)
@@ -278,9 +571,23 @@ with tabs[1]:
 
     st.subheader("🔍 Análisis comparativo entre años")
 
-    ca, cb = st.columns(2)
+    ca, cb, cc = st.columns(3)
     año_a = ca.selectbox("Año base",       [str(a) for a in AÑOS_DASHBOARD], index=0, key="comp_a")
     año_b = cb.selectbox("Año a comparar", [str(a) for a in AÑOS_DASHBOARD], index=1, key="comp_b")
+
+    # FIX: filtro de estado que afecta gráficos y tabla
+    all_estados_tab2 = sorted(set(
+        lics[lics["Año_pub"].isin([int(año_a), int(año_b)])]["Estado"].dropna().unique()
+    ))
+    estado_filtro_tab2 = cc.selectbox(
+        "Filtrar por estado", ["Todos"] + all_estados_tab2, key="est_tab2"
+    )
+
+    sub_a_pub = lics[lics["Año_pub"] == int(año_a)]
+    sub_b_pub = lics[lics["Año_pub"] == int(año_b)]
+    if estado_filtro_tab2 != "Todos":
+        sub_a_pub = sub_a_pub[sub_a_pub["Estado"] == estado_filtro_tab2]
+        sub_b_pub = sub_b_pub[sub_b_pub["Estado"] == estado_filtro_tab2]
 
     adj_a = lics[(lics["Año_pub"] == int(año_a)) & (lics["Estado"] == "Adjudicada")]
     adj_b = lics[(lics["Año_pub"] == int(año_b)) & (lics["Estado"] == "Adjudicada")]
@@ -288,6 +595,8 @@ with tabs[1]:
     # ── Visión completa: adjudicadas vs no adjudicadas ────────────────────────
     st.divider()
     st.markdown("#### Adjudicadas vs No adjudicadas — visión completa")
+    if estado_filtro_tab2 != "Todos":
+        st.caption(f"🔍 Filtro activo: **{estado_filtro_tab2}**")
 
     COLORES_ESTADO = {
         "Adjudicada":  "#21c354",
@@ -298,9 +607,6 @@ with tabs[1]:
         "Suspendida":  "#9b59b6",
         "Otro":        "#cccccc",
     }
-
-    sub_a_pub = lics[lics["Año_pub"] == int(año_a)]
-    sub_b_pub = lics[lics["Año_pub"] == int(año_b)]
 
     # Gráfico conteo por estado
     cnt_a = sub_a_pub["Estado"].value_counts().rename("N").reset_index()
@@ -356,6 +662,8 @@ with tabs[1]:
     # Tabla resumen por estado y año
     resumen_estado = []
     for año_iter, sub_iter in [(año_a, sub_a_pub), (año_b, sub_b_pub)]:
+        if sub_iter.empty:
+            continue
         for estado, grp in sub_iter.groupby("Estado"):
             resumen_estado.append({
                 "Año":     año_iter,
@@ -364,36 +672,43 @@ with tabs[1]:
                 "% Total": round(len(grp) / len(sub_iter) * 100, 1) if len(sub_iter) else 0,
                 "Monto":   grp["Monto_estimado"].sum(),
             })
-    df_res = pd.DataFrame(resumen_estado).sort_values(["Año", "Monto"], ascending=[True, False])
-    df_res["Monto_fmt"] = df_res["Monto"].apply(fmt_mm)
-    df_res["% Total"]   = df_res["% Total"].apply(lambda v: f"{v}%".replace(".", ","))
+    df_res = pd.DataFrame(resumen_estado).sort_values(["Año", "Monto"], ascending=[True, False]) if resumen_estado else pd.DataFrame()
+    if not df_res.empty:
+        df_res["Monto_fmt"] = df_res["Monto"].apply(fmt_mm)
+        df_res["% Total"]   = df_res["% Total"].apply(lambda v: f"{v}%".replace(".", ","))
 
-    # Aplicar filtro de selección
-    df_res_show = df_res.copy()
-    if sel_año:    df_res_show = df_res_show[df_res_show["Año"]    == sel_año]
-    if sel_estado: df_res_show = df_res_show[df_res_show["Estado"] == sel_estado]
+        # FIX: el filtro del selectbox de estado también aplica a la tabla
+        df_res_show = df_res.copy()
+        if estado_filtro_tab2 != "Todos":
+            df_res_show = df_res_show[df_res_show["Estado"] == estado_filtro_tab2]
+        if sel_año:    df_res_show = df_res_show[df_res_show["Año"]    == sel_año]
+        if sel_estado: df_res_show = df_res_show[df_res_show["Estado"] == sel_estado]
 
-    filtro_activo = f"Año: {sel_año or 'todos'}  |  Estado: {sel_estado or 'todos'}"
-    st.caption(f"🔍 Filtro activo → {filtro_activo}  {'— haz clic en el gráfico para filtrar, doble clic para limpiar' if not (sel_año or sel_estado) else '— doble clic en el gráfico para limpiar'}")
+        filtro_activo = f"Estado: {estado_filtro_tab2}  |  Año: {sel_año or 'todos'}  |  Segmento: {sel_estado or 'todos'}"
+        st.caption(f"🔍 Filtro → {filtro_activo}  {'— haz clic en el gráfico para filtrar por segmento, doble clic para limpiar' if not (sel_año or sel_estado) else '— doble clic en el gráfico para limpiar selección'}")
 
-    st.dataframe(
-        df_res_show[["Año","Estado","N","% Total","Monto"]].rename(columns={"Monto":"Monto estimado"}),
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Monto estimado": st.column_config.NumberColumn("Monto estimado", format="$ %,.0f"),
-        },
-    )
+        df_res_show["Monto estimado"] = df_res_show["Monto"].apply(fmt_mm)
+        st.dataframe(
+            df_res_show[["Año","Estado","N","% Total","Monto estimado"]],
+            use_container_width=True,
+            hide_index=True,
+        )
 
     # ── KPIs comparativos ──────────────────────────────────────────────────────
     st.divider()
     st.markdown("#### Solo adjudicadas — análisis de profundidad")
-    st.info("ℹ️ Todos los valores usan **año de publicación** como base — igual que el gráfico apilado de arriba. "
-            "Así 2024 vs 2025 compara el mismo universo de licitaciones.", icon="ℹ️")
+    st.info("ℹ️ Todos los valores usan **año de publicación** como base — igual que el gráfico apilado de arriba.", icon="ℹ️")
     k1, k2, k3 = st.columns(3)
     k1.metric(f"N° adjudicadas {año_a}", f"{len(adj_a):,}".replace(",","."))
-    k2.metric(f"N° adjudicadas {año_b}", f"{len(adj_b):,}".replace(",","."),
-              delta=f"{len(adj_b)-len(adj_a):+,}".replace(",","."))
+
+    # FIX: delta en % (verde si sube, rojo si baja)
+    if len(adj_a) > 0:
+        var_adj_pct = round((len(adj_b) - len(adj_a)) / len(adj_a) * 100, 1)
+        delta_adj_str = f"{var_adj_pct:+.1f}% vs {año_a}".replace(".", ",")
+    else:
+        delta_adj_str = f"{len(adj_b) - len(adj_a):+,}".replace(",",".")
+    k2.metric(f"N° adjudicadas {año_b}", f"{len(adj_b):,}".replace(",","."), delta=delta_adj_str)
+
     monto_a = adj_a["Monto_estimado"].sum()
     monto_b = adj_b["Monto_estimado"].sum()
     k3.metric("Diferencia de licitaciones", f"{len(adj_b)-len(adj_a):+,}".replace(",","."))
@@ -407,7 +722,7 @@ with tabs[1]:
 
     st.divider()
 
-    # ── Distribución de montos: detectar outliers ──────────────────────────────
+    # ── Distribución de montos ─────────────────────────────────────────────────
     st.markdown("#### Distribución de montos — ¿hay licitaciones muy grandes?")
     st.caption("Si la caja de un año está más arriba o tiene puntos muy alejados, hay outliers que explican la diferencia.")
 
@@ -437,16 +752,33 @@ with tabs[1]:
         top_a = adj_a.nlargest(10, "Monto_estimado")[
             ["Nombre","Medicamento","Organismo","Monto_estimado"]
         ].reset_index(drop=True)
-        st.dataframe(top_a, use_container_width=True,
-                     column_config={"Monto_estimado": st.column_config.NumberColumn("Monto", format="$ %,.0f")})
+        # FIX: monto en formato chileno pre-formateado; Nombre con ancho limitado
+        top_a["Monto"] = top_a["Monto_estimado"].apply(fmt_num)
+        st.dataframe(
+            top_a[["Nombre","Medicamento","Organismo","Monto"]],
+            use_container_width=True,
+            column_config={
+                "Nombre":    st.column_config.TextColumn("Nombre",    width="medium"),
+                "Monto":     st.column_config.TextColumn("Monto"),
+                "Organismo": st.column_config.TextColumn("Organismo", width="small"),
+            }
+        )
 
     with t2:
         st.markdown(f"**{año_b}**")
         top_b = adj_b.nlargest(10, "Monto_estimado")[
             ["Nombre","Medicamento","Organismo","Monto_estimado"]
         ].reset_index(drop=True)
-        st.dataframe(top_b, use_container_width=True,
-                     column_config={"Monto_estimado": st.column_config.NumberColumn("Monto", format="$ %,.0f")})
+        top_b["Monto"] = top_b["Monto_estimado"].apply(fmt_num)
+        st.dataframe(
+            top_b[["Nombre","Medicamento","Organismo","Monto"]],
+            use_container_width=True,
+            column_config={
+                "Nombre":    st.column_config.TextColumn("Nombre",    width="medium"),
+                "Monto":     st.column_config.TextColumn("Monto"),
+                "Organismo": st.column_config.TextColumn("Organismo", width="small"),
+            }
+        )
 
     st.divider()
 
@@ -456,7 +788,6 @@ with tabs[1]:
     org_b = adj_b.groupby("Organismo")["Monto_estimado"].sum().rename(año_b)
     df_org = pd.concat([org_a, org_b], axis=1).fillna(0)
     df_org["Total"] = df_org[año_a] + df_org[año_b]
-    # top 15 por monto total, ascendente para que plotly ponga el mayor arriba
     df_org = df_org.nlargest(15, "Total").sort_values("Total", ascending=True).reset_index()
     df_org_melt = df_org.melt(id_vars="Organismo", value_vars=[año_a, año_b],
                                var_name="Año", value_name="Monto")
@@ -515,7 +846,7 @@ with tabs[1]:
         orientation="h", barmode="group", text="Etiqueta",
         labels={"Monto_MM": "Monto (MM CLP)", "Medicamento": ""},
         color_discrete_map={año_a: "#0068c9", año_b: "#ff4b4b"},
-        height=500,
+        height=700,   # FIX: más alto para leer mejor los nombres
     )
     fig_med2.update_traces(textposition="outside")
     fig_med2.update_layout(**PLOTLY_LOCALE)
@@ -526,9 +857,8 @@ with tabs[1]:
 # TAB 3 — MEDICAMENTOS & LABORATORIOS
 # ══════════════════════════════════════════════════════════════════════════════
 
-with tabs[2]:  # noqa — índice correcto tras agregar tab de análisis
+with tabs[2]:
 
-    # Solo ítems cuya licitación existe en la tabla lics (evita conteos inconsistentes)
     _codes_en_lics = set(lics["Codigo"])
     items_med = items_ext[
         (items_ext["Medicamento"].str.strip() != "") &
@@ -587,204 +917,11 @@ with tabs[2]:  # noqa — índice correcto tras agregar tab de análisis
 
     st.divider()
 
-    # ── Tabla laboratorios clickeable ──────────────────────────────────────────
-    st.subheader("Detalle por laboratorio / proveedor")
-    if items_lab.empty:
-        st.info("Sin datos de proveedores.")
-    else:
-        lab_resumen = (
-            items_lab.groupby("Proveedor")
-            .agg(
-                Licitaciones = ("Codigo_licitacion", "nunique"),
-                Medicamentos = ("Medicamento",        "nunique"),
-                Monto_total  = ("Monto_efectivo",     "sum"),
-            ).sort_values("Monto_total", ascending=False).reset_index()
-        )
-        lab_resumen["Monto_fmt"] = lab_resumen["Monto_total"].apply(fmt_mm)
-        ev_lab = st.dataframe(
-            lab_resumen[["Proveedor","Licitaciones","Medicamentos","Monto_fmt"]].rename(
-                columns={"Monto_fmt": "Monto total"}),
-            use_container_width=True,
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row",
-        )
-        st.caption("💡 Haz clic en una fila para ver las licitaciones del laboratorio.")
-
-        lab_sel = None
-        if ev_lab.selection.rows:
-            lab_sel = lab_resumen.iloc[ev_lab.selection.rows[0]]["Proveedor"]
-
-        if lab_sel:
-            codes_lab = items_ext[items_ext["Proveedor"] == lab_sel]["Codigo_licitacion"].unique()
-            lics_lab  = lics[lics["Codigo"].isin(codes_lab)]
-
-            with st.expander(f"🏭 Licitaciones — **{lab_sel}**", expanded=True):
-                kl1, kl2, kl3 = st.columns(3)
-                kl1.metric("Licitaciones", f"{len(lics_lab):,}".replace(",","."))
-                kl2.metric("Adjudicadas",  f"{len(lics_lab[lics_lab['Estado']=='Adjudicada']):,}".replace(",","."))
-                kl3.metric("Monto estimado total", fmt_mm(lics_lab["Monto_estimado"].sum()))
-
-                df_lab_show = lics_lab[[
-                    "Codigo","Nombre","Medicamento","Estado",
-                    "Monto_estimado","Organismo","Fecha_adjudicacion"
-                ]].copy()
-                st.dataframe(
-                    df_lab_show.sort_values("Monto_estimado", ascending=False).reset_index(drop=True),
-                    use_container_width=True,
-                    column_config={
-                        "Monto_estimado":     st.column_config.NumberColumn("Monto estimado", format="$ %,.0f"),
-                        "Fecha_adjudicacion": st.column_config.DateColumn("Adjudicación", format="DD/MM/YYYY"),
-                    },
-                )
+    render_lab_section(items_lab, items_ext, lics)
 
     st.divider()
 
-    # ── Análisis de precios ────────────────────────────────────────────────────
-    st.subheader("Análisis de precios y volumen por medicamento")
-
-    meds_disponibles = sorted([m for m in items_med["Medicamento"].dropna().unique() if m.strip() != ""])
-    med_detalle_sel  = st.selectbox(
-        "Seleccionar medicamento para ver detalle",
-        ["— ver tabla completa —"] + meds_disponibles,
-        key="med_detalle_sel",
-    )
-
-    items_precio = items_med[items_med["Monto_unitario"] > 0]
-    if med_detalle_sel != "— ver tabla completa —":
-        items_precio = items_precio[items_precio["Medicamento"] == med_detalle_sel]
-
-    if items_precio.empty:
-        st.info("Sin datos de precio unitario disponibles.")
-    else:
-        precio_med = (
-            items_precio.groupby("Medicamento")
-            .agg(
-                Licitaciones        = ("Codigo_licitacion",  "nunique"),
-                Cant_licitada       = ("Cantidad_licitada",  "sum"),
-                Cant_adjudicada     = ("Cantidad_adjudicada","sum"),
-                Precio_prom         = ("Monto_unitario",     "mean"),
-                Precio_min          = ("Monto_unitario",     "min"),
-                Precio_max          = ("Monto_unitario",     "max"),
-                Monto_real          = ("Monto_efectivo",     "sum"),
-            ).reset_index()
-        )
-        precio_med["Pct_adj"] = (
-            precio_med["Cant_adjudicada"] / precio_med["Cant_licitada"] * 100
-        ).round(1).clip(upper=100)
-        precio_med = precio_med.sort_values("Monto_real", ascending=False)
-
-        # Precios en formato chileno (texto), monto en texto también para correcta visualización
-        precio_med["Precio_prom_fmt"] = precio_med["Precio_prom"].apply(lambda v: fmt_num(v, dec=3))
-        precio_med["Precio_min_fmt"]  = precio_med["Precio_min"].apply(lambda v: fmt_num(v, dec=3))
-        precio_med["Precio_max_fmt"]  = precio_med["Precio_max"].apply(lambda v: fmt_num(v, dec=3))
-        precio_med["Monto_real_fmt"]  = precio_med["Monto_real"].apply(fmt_mm)
-
-        tabla_precio = precio_med[[
-            "Medicamento","Licitaciones",
-            "Cant_licitada","Cant_adjudicada","Pct_adj",
-            "Precio_prom_fmt","Precio_min_fmt","Precio_max_fmt",
-            "Monto_real_fmt",
-        ]].rename(columns={
-            "Cant_licitada":   "Cant. licitada",
-            "Cant_adjudicada": "Cant. adjudicada",
-            "Pct_adj":         "% Adjudicado",
-            "Precio_prom_fmt": "Precio unit. prom.",
-            "Precio_min_fmt":  "Precio unit. mín.",
-            "Precio_max_fmt":  "Precio unit. máx.",
-            "Monto_real_fmt":  "Monto real",
-        })
-
-        ev_med = st.dataframe(
-            tabla_precio,
-            use_container_width=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            column_config={
-                "% Adjudicado": st.column_config.ProgressColumn(
-                    "% Adjudicado", min_value=0, max_value=100, format="%.1f%%"
-                ),
-                "Cant. licitada":   st.column_config.NumberColumn("Cant. licitada",   format="%,.0f"),
-                "Cant. adjudicada": st.column_config.NumberColumn("Cant. adjudicada", format="%,.0f"),
-            },
-        )
-        st.caption("💡 Haz clic en una fila para ver el resumen del medicamento.")
-
-        if ev_med.selection.rows:
-            med_sel = precio_med.iloc[ev_med.selection.rows[0]]["Medicamento"]
-            lics_med = lics[lics["Medicamento"] == med_sel]
-            its_med  = items_ext[items_ext["Medicamento"] == med_sel]
-
-            with st.expander(f"💊 Resumen: **{med_sel}**", expanded=True):
-                km1, km2, km3, km4 = st.columns(4)
-                km1.metric("Licitaciones",      f"{len(lics_med):,}".replace(",","."))
-                km2.metric("Adjudicadas",       f"{len(lics_med[lics_med['Estado']=='Adjudicada']):,}".replace(",","."))
-                km3.metric("Organismos",        f"{lics_med['Organismo'].nunique():,}".replace(",","."))
-                km4.metric("Monto total",       fmt_mm(lics_med["Monto_estimado"].sum()))
-
-                ec1, ec2 = st.columns(2)
-                with ec1:
-                    por_año_m = (lics_med[lics_med["Año_pub"].isin(AÑOS_DASHBOARD)]
-                                 .groupby("Año_pub")["Monto_estimado"].sum().reset_index())
-                    por_año_m["Año"] = por_año_m["Año_pub"].astype(str)
-                    por_año_m["MM"]  = por_año_m["Monto_estimado"] / 1e6
-                    por_año_m["Lbl"] = por_año_m["Monto_estimado"].apply(fmt_mm)
-                    fig_m_año = px.bar(por_año_m, x="Año", y="MM", text="Lbl",
-                                       title="Monto por año", color_discrete_sequence=["#ff4b4b"])
-                    fig_m_año.update_traces(textposition="outside")
-                    fig_m_año.update_layout(**PLOTLY_LOCALE)
-                    st.plotly_chart(fig_m_año, use_container_width=True)
-
-                with ec2:
-                    por_org_m = (lics_med.groupby("Organismo")["Monto_estimado"]
-                                 .sum().sort_values(ascending=True).tail(8).reset_index())
-                    por_org_m["MM"]  = por_org_m["Monto_estimado"] / 1e6
-                    por_org_m["Lbl"] = por_org_m["Monto_estimado"].apply(fmt_mm)
-                    fig_m_org = px.bar(por_org_m, x="MM", y="Organismo", orientation="h",
-                                       text="Lbl", title="Top organismos",
-                                       color_discrete_sequence=["#0068c9"])
-                    fig_m_org.update_traces(textposition="outside")
-                    fig_m_org.update_layout(**PLOTLY_LOCALE)
-                    st.plotly_chart(fig_m_org, use_container_width=True)
-
-                st.markdown("**Licitaciones**")
-                df_med_show = lics_med[["Codigo","Nombre","Estado","Monto_estimado",
-                                         "Organismo","Fecha_adjudicacion"]].copy()
-                st.dataframe(df_med_show.reset_index(drop=True), use_container_width=True,
-                             column_config={
-                                 "Monto_estimado":     st.column_config.NumberColumn("Monto estimado", format="$ %,.0f"),
-                                 "Fecha_adjudicacion": st.column_config.DateColumn("Adjudicación", format="DD/MM/YYYY"),
-                             })
-
-                # Proveedores / laboratorios para este medicamento
-                provs = (
-                    its_med[its_med["Proveedor"].str.strip() != ""]
-                    .groupby("Proveedor")
-                    .agg(Items=("Correlativo","count"), Monto=("Monto_efectivo","sum"))
-                    .sort_values("Monto", ascending=False).reset_index()
-                )
-                if not provs.empty:
-                    st.markdown("**Proveedores / Laboratorios**")
-                    st.dataframe(provs, use_container_width=True, hide_index=True,
-                                 column_config={
-                                     "Monto": st.column_config.NumberColumn("Monto total", format="$ %,.0f"),
-                                 })
-
-        # Gráfico precio unitario promedio top 15
-        st.subheader("Precio unitario promedio — Top 15 medicamentos")
-        top_precio = precio_med.nlargest(15, "Precio_prom").sort_values("Precio_prom")
-        top_precio["Etiqueta"] = top_precio["Precio_prom"].apply(lambda v: fmt_num(v, dec=3))
-
-        fig_precio = px.bar(
-            top_precio, x="Precio_prom", y="Medicamento",
-            orientation="h", text="Etiqueta",
-            labels={"Precio_prom": "Precio unitario promedio (CLP)", "Medicamento": ""},
-            color_discrete_sequence=["#f0a500"],
-        )
-        fig_precio.update_traces(textposition="outside")
-        fig_precio.update_layout(xaxis_tickformat=",.", height=520, **PLOTLY_LOCALE)
-        st.plotly_chart(fig_precio, use_container_width=True)
-        st.caption("Precio promedio basado en ítems con monto unitario informado en la API.")
+    render_precios_section(items_med, items_ext, lics)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -793,7 +930,6 @@ with tabs[2]:  # noqa — índice correcto tras agregar tab de análisis
 
 with tabs[3]:
 
-    # Solo Publicada y Suspendida = verdaderamente abiertos
     abiertos = lics[lics["Estado"].isin(ESTADOS_ABIERTOS)].copy()
 
     st.subheader(f"🔓 Procesos abiertos — {len(abiertos):,} licitaciones".replace(",", "."))
@@ -865,22 +1001,7 @@ with tabs[3]:
         (df_ab["Monto_estimado"] <= rango_monto[1])
     ]
 
-    df_ab_show = df_ab[[
-        "Codigo","Nombre","Medicamento","Estado","Monto_estimado",
-        "Organismo","Region","Fecha_publicacion","Fecha_adjudicacion"
-    ]].copy()
-
-    st.dataframe(
-        df_ab_show.reset_index(drop=True),
-        use_container_width=True,
-        height=500,
-        column_config={
-            "Monto_estimado":     st.column_config.NumberColumn("Monto estimado (CLP)", format="$ %,.0f"),
-            "Fecha_publicacion":  st.column_config.DateColumn("Fecha publicación",  format="DD/MM/YYYY"),
-            "Fecha_adjudicacion": st.column_config.DateColumn("Fecha adjudicación", format="DD/MM/YYYY"),
-        },
-    )
-    st.caption(f"{len(df_ab):,} procesos mostrados".replace(",", "."))
+    render_abiertos_tabla(df_ab, items_ext)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -933,15 +1054,16 @@ with tabs[4]:
         "Codigo","Nombre","Medicamento","Estado","Monto_estimado",
         "Organismo","Region","Fecha_publicacion","Fecha_adjudicacion"
     ]].copy()
+    df_all_show["Monto estimado"] = df_all_show["Monto_estimado"].apply(fmt_num)
+    df_all_disp = df_all_show.drop(columns=["Monto_estimado"])
 
     ev_all = st.dataframe(
-        df_all_show.reset_index(drop=True),
+        df_all_disp.reset_index(drop=True),
         use_container_width=True,
         height=500,
         on_select="rerun",
         selection_mode="single-row",
         column_config={
-            "Monto_estimado":     st.column_config.NumberColumn("Monto estimado (CLP)", format="$ %,.0f"),
             "Fecha_publicacion":  st.column_config.DateColumn("Fecha publicación",  format="DD/MM/YYYY"),
             "Fecha_adjudicacion": st.column_config.DateColumn("Fecha adjudicación", format="DD/MM/YYYY"),
         },
@@ -984,11 +1106,15 @@ with tabs[4]:
                     "Correlativo","NombreProducto","Categoria","UnidadMedida",
                     "Cantidad_licitada","Cantidad_adjudicada","Monto_unitario","Monto_total_item","Proveedor"
                 ]].copy()
-                for col in ["Cantidad_licitada","Cantidad_adjudicada"]:
-                    its_show[col] = its_show[col].apply(lambda v: f"{v:,.0f}".replace(",","."))
-                its_show["Monto_unitario"]   = its_show["Monto_unitario"].apply(lambda v: fmt_num(v, dec=3))
-                its_show["Monto_total_item"] = its_show["Monto_total_item"].apply(fmt_num)
-                st.dataframe(its_show.reset_index(drop=True), use_container_width=True)
+                its_show["Cant. licitada"]   = its_show["Cantidad_licitada"].apply(fmt_cant)
+                its_show["Cant. adjudicada"] = its_show["Cantidad_adjudicada"].apply(fmt_cant)
+                its_show["Monto unitario"]   = its_show["Monto_unitario"].apply(lambda v: fmt_num(v, dec=3))
+                its_show["Monto total"]      = its_show["Monto_total_item"].apply(fmt_num)
+                st.dataframe(
+                    its_show[["Correlativo","NombreProducto","Categoria","UnidadMedida",
+                               "Cant. licitada","Cant. adjudicada","Monto unitario","Monto total","Proveedor"]].reset_index(drop=True),
+                    use_container_width=True,
+                )
             else:
                 st.info("Sin ítems registrados para esta licitación.")
 
@@ -1001,7 +1127,6 @@ with tabs[5]:
 
     st.subheader("🗄️ Modelo de datos — oncologia.db")
 
-    # ── Diagrama ERD ───────────────────────────────────────────────────────────
     st.markdown("#### Diagrama Entidad-Relación")
 
     st.components.v1.html("""
@@ -1026,7 +1151,6 @@ with tabs[5]:
   .rel-line svg { margin:0 4px; }
 </style>
 <div class="erd">
-  <!-- TABLA LICITACIONES -->
   <div class="tbl">
     <div class="tbl-header">📄 licitaciones &nbsp;<span style="font-size:11px;opacity:.8">(1 fila = 1 proceso)</span></div>
     <table width="100%">
@@ -1050,8 +1174,6 @@ with tabs[5]:
       <tr style="color:#aaa"><td colspan="2" style="padding:4px 14px;font-size:11px">+ 23 columnas adicionales</td></tr>
     </table>
   </div>
-
-  <!-- LÍNEA DE RELACIÓN -->
   <div class="rel">
     <div class="rel-line">
       <span>1</span>
@@ -1063,8 +1185,6 @@ with tabs[5]:
       <span>N</span>
     </div>
   </div>
-
-  <!-- TABLA ITEMS -->
   <div class="tbl">
     <div class="tbl-header" style="background:#ff4b4b">📦 items &nbsp;<span style="font-size:11px;opacity:.8">(1 fila = 1 ítem/producto)</span></div>
     <table width="100%">
@@ -1094,7 +1214,6 @@ with tabs[5]:
 
     st.divider()
 
-    # ── Tabla licitaciones completa ────────────────────────────────────────────
     st.subheader(f"📄 Tabla licitaciones — {len(lics_raw):,} registros".replace(",","."))
 
     col_bl1, col_bl2 = st.columns(2)
@@ -1134,7 +1253,6 @@ with tabs[5]:
 
     st.divider()
 
-    # ── Tabla ítems completa ───────────────────────────────────────────────────
     st.subheader(f"📦 Tabla ítems — {len(items_raw):,} registros".replace(",","."))
 
     col_bi1, col_bi2 = st.columns(2)
